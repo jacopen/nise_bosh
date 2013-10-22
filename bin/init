@@ -3,25 +3,102 @@
 bosh_app_dir=/var/vcap
 bosh_dir=${bosh_app_dir}/bosh
 
-apt-get update
+if [ `lsb_release -is` == "CentOS"]
+  set -e
+  
+  base_dir=$(readlink -nf $(dirname $0)/../..)
+  source $base_dir/lib/prelude_apply.bash
+  
+  
+  # Upgrade upstart first, to prevent it from messing up our stubs and starting daemons anyway
+  pkg_mgr install upstart
+  
+  # Install base packages needed by both the warden and bosh
+  packages="build-essential openssl-devel lsof \
+  strace bind9-host dnsutils tcpdump iputils-arping \
+  curl wget libcurl3 libcurl3-dev bison \
+  readline-devel \
+  libxml2 libxml2-devel libxslt libxslt-devel \
+  dhclient \
+  zip unzip \
+  nfs-common flex psmisc apparmor-utils iptables sysstat \
+  rsync openssh-server traceroute libncurses5-dev quota \
+  libaio1 gdb libcap2-bin libcap-devel bzip2-devel \
+  libyaml-devel cmake sudo nc rsyslog-relp"
+  pkg_mgr install $packages
+  
+  # Lifted from bosh_debs
+  #pkg_mgr install "scsitools mg htop module-assistant debhelper"
+  #/Lifted from bosh_debs
+  
+  # runit
+  pkg_mgr install "rpm-build rpmdevtools glibc-static"
+  cookbook_release=1.2.0
+  runit_version=runit-2.1.1
+  run_in_chroot $chroot "
+    curl -L https://github.com/opscode-cookbooks/runit/archive/v${cookbook_release}.tar.gz > /tmp/v${cookbook_release}.tar.gz
+    tar -C /tmp -xvf /tmp/v${cookbook_release}.tar.gz
+    tar -C /tmp -xvf /tmp/runit-${cookbook_release}/files/default/${runit_version}.tar.gz
+    cd /tmp/${runit_version}
+    ./build.sh
+    rpm -i /rpmbuild/RPMS/${runit_version}.rpm
+  "
+  #/runit
+  
+  mkdir -p $chroot/var/lib/rpm
+  rpm --root $chroot --rebuilddb
+  rpm --root $chroot --force --nodeps --install http://mirror.centos.org/centos/6/os/x86_64/Packages/centos-release-6-4.el6.centos.10.x86_64.rpm
+  
+  cp /etc/resolv.conf $chroot/etc/resolv.conf
+  
+  unshare -m $SHELL <<INSTALL_YUM
+    set -x
+  
+    mkdir -p /etc/pki
+    mount --no-mtab --bind $chroot/etc/pki /etc/pki
+    yum --installroot=$chroot --assumeyes install yum
+INSTALL_YUM
 
-# stemcell_builder/stages/base_apt/apply.sh
-DEBIAN_FRONTEND=noninteractive apt-get install -f -y --force-yes --no-install-recommends \
-build-essential libssl-dev lsof \
-strace bind9-host dnsutils tcpdump iputils-arping \
-curl wget libcurl3 libcurl3-dev bison libreadline6-dev \
-libxml2 libxml2-dev libxslt1.1 libxslt1-dev zip unzip \
-nfs-common flex psmisc apparmor-utils iptables sysstat \
-rsync openssh-server traceroute libncurses5-dev quota \
-libaio1 gdb tripwire libcap2-bin libyaml-dev
-
-# stemcell_builder/stages/bosh_monit/apply.sh
-DEBIAN_FRONTEND=noninteractive apt-get install -f -y --force-yes --no-install-recommends runit
-
-# installed somewhere else
-DEBIAN_FRONTEND=noninteractive apt-get install -f -y --force-yes --no-install-recommends \
-gettext
-
+  run_in_chroot $chroot "
+  rpm --force --nodeps --install http://mirror.centos.org/centos/6/os/x86_64/Packages/centos-release-6-4.el6.centos.10.x86_64.rpm
+  rpm --force --nodeps --install http://dl.fedoraproject.org/pub/epel/6/x86_64/epel-release-6-8.noarch.rpm
+  yum --assumeyes groupinstall Base
+  yum --assumeyes groupinstall 'Development Tools'
+  "
+  
+  touch ${chroot}/etc/sysconfig/network # must be present for network to be configured
+elif [ `lsb_release -is` == "Ubuntu" ]
+  apt-get update
+  
+  # stemcell_builder/stages/base_apt/apply.sh
+  DEBIAN_FRONTEND=noninteractive apt-get install -f -y --force-yes --no-install-recommends \
+  build-essential libssl-dev lsof \
+  strace bind9-host dnsutils tcpdump iputils-arping \
+  curl wget libcurl3 libcurl3-dev bison libreadline6-dev \
+  libxml2 libxml2-dev libxslt1.1 libxslt1-dev zip unzip \
+  nfs-common flex psmisc apparmor-utils iptables sysstat \
+  rsync openssh-server traceroute libncurses5-dev quota \
+  libaio1 gdb tripwire libcap2-bin libyaml-dev
+  
+  # stemcell_builder/stages/bosh_monit/apply.sh
+  DEBIAN_FRONTEND=noninteractive apt-get install -f -y --force-yes --no-install-recommends runit
+  
+  # installed somewhere else
+  DEBIAN_FRONTEND=noninteractive apt-get install -f -y --force-yes --no-install-recommends \
+  gettext
+  
+  # stemcell_builder/stages/system_kernel/apply.sh
+  if [ `lsb_release -cs` ==  "lucid" ]
+  then
+    variant="lts-backport-oneiric"
+  
+    # Headers are needed for open-vm-tools
+    apt-get install -y linux-image-virtual-${variant} linux-headers-virtual-${variant}
+  else
+    apt-get install -y linux-image-virtual
+  fi
+fi
+  
 # bosh_agent/lib/bosh_agent/platform/ubuntu/templates/logrotate.erb
 cat <<EOF > /etc/logrotate.d/nise_bosh
 /var/vcap/sys/log/*.log /var/vcap/sys/log/*/*.log /var/vcap/sys/log/*/*/*.log {
@@ -45,17 +122,6 @@ if [ `cat /etc/passwd | cut -f1 -d ":" | grep "^vcap$" -c` -eq 0 ]; then
     done
 else
     echo "User vcap exists already, skippking adduser..."
-fi
-
-# stemcell_builder/stages/system_kernel/apply.sh
-if [ `lsb_release -cs` ==  "lucid" ]
-then
-  variant="lts-backport-oneiric"
-
-  # Headers are needed for open-vm-tools
-  apt-get install -y linux-image-virtual-${variant} linux-headers-virtual-${variant}
-else
-  apt-get install -y linux-image-virtual
 fi
 
 # stemcell_builder/stages/bosh_monit/apply.sh
